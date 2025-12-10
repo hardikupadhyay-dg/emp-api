@@ -1,4 +1,4 @@
-name: CI-CD to AWS Lambda and ECR
+name: CI/CD Deploy to AWS Lambda + ECR
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  LAMBDA_FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
   S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  LAMBDA_FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
   ECR_URI: ${{ secrets.ECR_URI }}
 
 jobs:
@@ -15,54 +15,70 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      # Configure AWS credentials (from GitHub secrets)
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # ---------------------------
+      # ECR Login (NON-INTERACTIVE)
+      # ---------------------------
       - name: Login to Amazon ECR
-        id: ecr-login
         run: |
           aws ecr get-login-password --region "$AWS_REGION" \
-          | docker login --username AWS --password-stdin "$(echo "$ECR_URI" | cut -d'/' -f1)"
+          | docker login \
+              --username AWS \
+              --password-stdin "$ECR_URI"
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_URI: ${{ secrets.ECR_URI }}
 
-      - name: Build and push Docker image to ECR
+      # Build Docker image
+      - name: Build Docker image
+        run: docker build -t emp-api-image .
+
+      # Tag and push image to ECR
+      - name: Tag & Push Docker image
         run: |
           IMAGE_TAG=${GITHUB_SHA::7}
-          docker build -t emp-api-image .
           docker tag emp-api-image:latest "$ECR_URI:$IMAGE_TAG"
-          docker push "$ECR_URI:$IMAGE_TAG"
           docker tag emp-api-image:latest "$ECR_URI:latest"
+          docker push "$ECR_URI:$IMAGE_TAG"
           docker push "$ECR_URI:latest"
 
+      # Package Lambda ZIP
       - name: Package Lambda ZIP
         run: |
           mkdir -p build
           zip -j build/lambda_package.zip lambda_function.py
 
+      # Upload ZIP to S3
       - name: Upload ZIP to S3
         run: |
           S3_KEY="lambda/lambda_package-${GITHUB_SHA}.zip"
           aws s3 cp build/lambda_package.zip "s3://$S3_BUCKET/$S3_KEY"
           echo "S3_KEY=$S3_KEY" >> $GITHUB_ENV
 
-      - name: Create or update Lambda function
+      # Create or Update Lambda Function
+      - name: Deploy Lambda Function
         run: |
           set -e
-          echo "Checking if Lambda function exists..."
+          echo "Checking Lambda..."
           if aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" > /dev/null 2>&1; then
-            echo "Function exists, updating code..."
+            echo "Updating Lambda code..."
             aws lambda update-function-code \
               --function-name "$LAMBDA_FUNCTION_NAME" \
               --s3-bucket "$S3_BUCKET" \
               --s3-key "$S3_KEY"
           else
-            echo "Function does not exist, creating..."
+            echo "Creating Lambda..."
             ROLE_ARN=$(aws iam get-role --role-name EmpApiLambdaRole --query 'Role.Arn' --output text)
             aws lambda create-function \
               --function-name "$LAMBDA_FUNCTION_NAME" \
