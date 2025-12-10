@@ -1,0 +1,76 @@
+name: CI-CD to AWS Lambda and ECR
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  LAMBDA_FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  ECR_URI: ${{ secrets.ECR_URI }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+          | docker login --username AWS --password-stdin "$(echo "$ECR_URI" | cut -d'/' -f1)"
+
+      - name: Build and push Docker image to ECR
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          docker build -t emp-api-image .
+          docker tag emp-api-image:latest "$ECR_URI:$IMAGE_TAG"
+          docker push "$ECR_URI:$IMAGE_TAG"
+          docker tag emp-api-image:latest "$ECR_URI:latest"
+          docker push "$ECR_URI:latest"
+
+      - name: Package Lambda ZIP
+        run: |
+          mkdir -p build
+          zip -j build/lambda_package.zip lambda_function.py
+
+      - name: Upload ZIP to S3
+        run: |
+          S3_KEY="lambda/lambda_package-${GITHUB_SHA}.zip"
+          aws s3 cp build/lambda_package.zip "s3://$S3_BUCKET/$S3_KEY"
+          echo "S3_KEY=$S3_KEY" >> $GITHUB_ENV
+
+      - name: Create or update Lambda function
+        run: |
+          set -e
+          echo "Checking if Lambda function exists..."
+          if aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" > /dev/null 2>&1; then
+            echo "Function exists, updating code..."
+            aws lambda update-function-code \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --s3-bucket "$S3_BUCKET" \
+              --s3-key "$S3_KEY"
+          else
+            echo "Function does not exist, creating..."
+            ROLE_ARN=$(aws iam get-role --role-name EmpApiLambdaRole --query 'Role.Arn' --output text)
+            aws lambda create-function \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --runtime python3.11 \
+              --role "$ROLE_ARN" \
+              --handler lambda_function.lambda_handler \
+              --code S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+              --environment "Variables={EMP_TABLE_NAME=Emp_Master}" \
+              --timeout 10 \
+              --memory-size 128
+          fi
